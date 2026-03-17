@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyscid"
+version = "0.1.0"
+description = "A pure Python library for reading SCID chess database files"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "GPL-2.0-only"
+authors = [
+    {name = "zaderrr", email = "your.email@example.com"}
+]
+maintainers = [
+    {name = "zaderrr", email = "your.email@example.com"}
+]
+keywords = [
+    "chess",
+    "scid",
+    "pyscid",
+    "si4",
+    "si5",
+    "pgn",
+    "database",
+    "games",
+    "chess-database",
+    "scid4",
+    "scid5"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Games/Entertainment :: Board Games",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed"
+]
+
+[project.urls]
+Homepage = "https://github.com/zaderrr/pyscid"
+Repository = "https://github.com/zaderrr/pyscid"
+Issues = "https://github.com/zaderrr/pyscid/issues"
+Changelog = "https://github.com/zaderrr/pyscid/releases"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "build>=0.10.0",
+    "twine>=4.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyscid*"]
+exclude = ["tests*", "test*"]
+
+[tool.setuptools.package-data]
+pyscid = ["py.typed"]

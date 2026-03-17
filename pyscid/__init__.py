@@ -18,6 +18,7 @@ from .types import Color, Piece, Result, Square, RatingType
 from .date import decode_date, encode_date
 from .game import Game, Move, IndexEntry
 from .database import Database
+from .namebase_interface import NameEntry, NameBaseInterface
 
 __version__ = "0.1.0"
 __all__ = [
@@ -25,6 +26,8 @@ __all__ = [
     "Game",
     "Move",
     "IndexEntry",
+    "NameEntry",
+    "NameBaseInterface",
     "Color",
     "Piece",
     "Result",

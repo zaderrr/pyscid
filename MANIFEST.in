@@ -1,0 +1,15 @@
+# Include important metadata files
+include README.md
+include LICENSE
+include pyproject.toml
+
+# Include type information
+include pyscid/py.typed
+
+# Exclude unnecessary files
+exclude .gitignore
+recursive-exclude tests *
+recursive-exclude test *
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * .DS_Store
