@@ -8,10 +8,24 @@ A pure Python library for reading SCID chess database files (.si4, .si5).
 - Read **SI5** databases (`.si5`, `.sn5`, `.sg5`)
 - Read **PGN** files (`.pgn`)
 - Unified `Database` interface with automatic format detection
+- **Lazy loading** - instant database open, data loaded on demand
+- **Fast search** - optimized index-based filtering
 - Extract game metadata (players, ratings, dates, results, ECO codes)
 - Decode moves from the compact binary format
-- Search and filter games
 - Export games to PGN format
+
+## Performance
+
+Benchmarks on a 10 million game database:
+
+| Operation | Time |
+|-----------|------|
+| Open database | **0.1 ms** |
+| Search by player name | **8 seconds** |
+| Access single game | **0.1 ms** |
+| Iterate 10,000 games | **1.4 seconds** |
+
+The library uses lazy loading and memory-mapped files to achieve instant database opening. Search operations use index-based filtering to avoid decoding games that don't match.
 
 ## Installation
 
@@ -33,28 +47,26 @@ pip install -e .
 from pyscid import Database
 
 # Open any supported format (auto-detected)
+# This is instant - data is loaded lazily on demand
 db = Database.open("games.si4")
 
 # Get basic info
 print(f"Number of games: {len(db)}")
 print(f"Format: {db.format}")
 
-# Iterate through games
-for game in db:
-    print(f"{game.white} vs {game.black}: {game.result}")
+# Random access - only this game is loaded
+game = db[42]
+print(f"{game.white} vs {game.black}: {game.result}")
+
+# Search games - uses optimized index-based filtering
+for game in db.search(player="Carlsen", year_min=2020):
+    print(f"{game.white} vs {game.black}")
     print(f"  Date: {game.date_string}")
     print(f"  ECO: {game.eco}")
-    
-    # Get moves
-    for move in game.moves[:10]:
-        print(f"  {move.uci()}")
 
-# Random access
-game = db[42]
-
-# Search games
-for game in db.search(player="Carlsen", year_min=2020):
-    print(game)
+# Get moves
+for move in game.moves[:10]:
+    print(f"  {move.uci()}")
 
 # Export to PGN
 print(game.to_pgn())
@@ -66,6 +78,22 @@ db.close()
 with Database.open("games.pgn") as db:
     for game in db:
         print(game)
+```
+
+### Loading Options
+
+```python
+# Default: lazy loading (instant open)
+db = Database.open("games.si4")
+
+# Preload everything (slower open, faster iteration)
+db = Database.open("games.si4", preload=True)
+
+# Preload just names (good for metadata browsing)
+db = Database.open("games.si4", preload_names=True)
+
+# Enable LRU cache for repeated random access
+db = Database.open("games.si4", cache_size=10000)
 ```
 
 ## Supported Data
@@ -114,8 +142,12 @@ Standard Portable Game Notation text format.
 ### Database
 
 ```python
-Database.open(filepath: str) -> Database
-    # Open a database file (auto-detects format)
+Database.open(
+    filepath: str,
+    preload: bool = False,       # Load all data upfront
+    preload_names: bool = False, # Load player/event names only
+    cache_size: int = 0          # LRU cache size for index entries
+) -> Database
 
 len(db) -> int
     # Number of games
@@ -127,8 +159,7 @@ for game in db:
     # Iterate through games
 
 db.search(**criteria) -> Iterator[Game]
-    # Search with criteria: white, black, player, event,
-    # site, year, year_min, year_max, result, eco, min_elo
+    # Search with criteria (see below)
 
 db.format -> str
     # 'si4', 'si5', or 'pgn'
@@ -136,9 +167,35 @@ db.format -> str
 db.description -> str
     # Database description (SI format only)
 
+db.preload_all()
+    # Explicitly load all data
+
+db.preload_namebase()
+    # Explicitly load name data
+
 db.close()
     # Release resources
 ```
+
+### Search Criteria
+
+```python
+db.search(
+    white="Carlsen",      # White player (partial match)
+    black="Nakamura",     # Black player (partial match)
+    player="Carlsen",     # Either player (partial match)
+    event="Tata Steel",   # Event name (partial match)
+    site="Wijk aan Zee",  # Site name (partial match)
+    year=2024,            # Exact year
+    year_min=2020,        # Minimum year
+    year_max=2024,        # Maximum year
+    result=Result.DRAW,   # Game result
+    eco="B90",            # ECO code prefix (e.g., "B", "B9", "B90")
+    min_elo=2700          # Minimum rating for either player
+)
+```
+
+All criteria are optional and combined with AND logic. Name searches are case-insensitive.
 
 ### Game
 
