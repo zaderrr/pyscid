@@ -355,6 +355,8 @@ class Scid5Database:
         self._player_name_index: Optional[Dict[str, int]] = None
         self._event_name_index: Optional[Dict[str, int]] = None
         self._site_name_index: Optional[Dict[str, int]] = None
+        # Cache for player ID -> game indices (built on first full scan)
+        self._player_game_index: Optional[Dict[int, List[int]]] = None
 
     @property
     def description(self) -> str:
@@ -690,12 +692,64 @@ class Scid5Database:
         term = search_term.lower()
         return {sid for name, sid in self._site_name_index.items() if term in name}
 
+    def _ensure_player_game_index(self):
+        """
+        Build player ID -> game indices mapping.
+
+        This scans all games once and maps each player ID to the list of
+        game indices where they played. Enables instant player lookups after
+        the first scan.
+        """
+        if self._player_game_index is not None:
+            return
+
+        if self._index_mmap is None:
+            return
+
+        from collections import defaultdict
+
+        player_games: Dict[int, List[int]] = defaultdict(list)
+
+        num_games = len(self)
+        index_mmap = self._index_mmap
+
+        for game_num in range(num_games):
+            offset = game_num * INDEX_ENTRY_SIZE
+            data = index_mmap[offset : offset + INDEX_ENTRY_SIZE]
+
+            # Extract just white_id and black_id
+            fields = extract_search_fields_v5(data)
+            white_id, black_id = fields[0], fields[1]
+
+            player_games[white_id].append(game_num)
+            if black_id != white_id:
+                player_games[black_id].append(game_num)
+
+        self._player_game_index = dict(player_games)
+
+    def _get_games_for_player_ids(self, player_ids: Set[int]) -> Set[int]:
+        """Get all game indices where any of the player IDs played."""
+        self._ensure_player_game_index()
+
+        if self._player_game_index is None:
+            return set()
+
+        game_indices: Set[int] = set()
+        for pid in player_ids:
+            if pid in self._player_game_index:
+                game_indices.update(self._player_game_index[pid])
+
+        return game_indices
+
     def search(self, **criteria) -> Iterator[Game]:
         """
         Search for games matching the given criteria.
 
         This is an optimized search that filters on IndexEntry fields first
         (fast integer comparisons), then only decodes games that match.
+
+        For player searches, builds a player->games index on first use for
+        instant subsequent lookups.
 
         Supported criteria:
             white: str - White player name (partial match, case-insensitive)
@@ -753,6 +807,46 @@ class Scid5Database:
         eco_prefix = criteria.get("eco", "").upper()
         min_elo = criteria.get("min_elo", 0)
 
+        # Check if we can use the fast player game index
+        has_other_criteria = (
+            year
+            or year_min
+            or year_max
+            or result_filter
+            or eco_prefix
+            or min_elo
+            or event_ids
+            or site_ids
+        )
+
+        # Fast path: player-only search with cached index
+        if (
+            player_ids is not None
+            and not has_other_criteria
+            and white_ids is None
+            and black_ids is None
+        ):
+            game_indices = self._get_games_for_player_ids(player_ids)
+            for game_num in sorted(game_indices):
+                yield self.get_game(game_num)
+            return
+
+        # Fast path: white-only search with cached index
+        if (
+            white_ids is not None
+            and not has_other_criteria
+            and player_ids is None
+            and black_ids is None
+        ):
+            self._ensure_player_game_index()
+            if self._player_game_index:
+                candidate_games = self._get_games_for_player_ids(white_ids)
+                for game_num in sorted(candidate_games):
+                    ie = self.get_index_entry(game_num)
+                    if ie.white_id in white_ids:
+                        yield self._get_game_from_entry(ie)
+                return
+
         # Convert result enum to int for fast comparison
         result_int = result_filter.value if result_filter is not None else None
 
@@ -761,14 +855,28 @@ class Scid5Database:
         if eco_prefix:
             eco_code_min, eco_code_max = self._eco_prefix_to_range(eco_prefix)
 
-        # Fast scan using extract_search_fields_v5 instead of full decode
+        # Determine which games to scan
         if self._index_mmap is None:
             return
 
-        num_games = len(self)
         index_mmap = self._index_mmap
 
-        for game_num in range(num_games):
+        # If we have player criteria and the index is built, use it to narrow candidates
+        candidate_games: Optional[Set[int]] = None
+        if player_ids is not None and self._player_game_index is not None:
+            candidate_games = self._get_games_for_player_ids(player_ids)
+        elif white_ids is not None and self._player_game_index is not None:
+            candidate_games = self._get_games_for_player_ids(white_ids)
+        elif black_ids is not None and self._player_game_index is not None:
+            candidate_games = self._get_games_for_player_ids(black_ids)
+
+        # If no candidate narrowing, scan all games
+        if candidate_games is None:
+            games_to_scan = range(len(self))
+        else:
+            games_to_scan = sorted(candidate_games)
+
+        for game_num in games_to_scan:
             offset = game_num * INDEX_ENTRY_SIZE
             data = index_mmap[offset : offset + INDEX_ENTRY_SIZE]
 
