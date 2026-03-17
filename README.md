@@ -8,10 +8,33 @@ A pure Python library for reading SCID chess database files (.si4, .si5).
 - Read **SI5** databases (`.si5`, `.sn5`, `.sg5`)
 - Read **PGN** files (`.pgn`)
 - Unified `Database` interface with automatic format detection
+- **Lazy loading** - instant database open, data loaded on demand
+- **Fast search** - optimized index-based filtering
 - Extract game metadata (players, ratings, dates, results, ECO codes)
 - Decode moves from the compact binary format
-- Search and filter games
 - Export games to PGN format
+
+## Performance
+
+Benchmarks on a 10 million game database:
+
+| Operation | Time |
+|-----------|------|
+| Open database | **0.1 ms** |
+| Load namebase (580K players) | **0.5 seconds** |
+| Search by name (first time) | **11 seconds** (builds index) |
+| Search by name (cached) | **0.5 - 1.5 seconds** |
+| Search by ID (first time) | **11 seconds** (builds index) |
+| Search by ID (cached) | **0.001 - 0.01 seconds** |
+| Combined search (ID + year) | **0.007 seconds** |
+| Access single game | **0.1 ms** |
+| Iterate 10,000 games | **1.4 seconds** |
+
+The library uses:
+- **Lazy loading** - instant database open, data loaded on demand
+- **Memory-mapped files** - efficient access without loading entire files
+- **Player-game index** - built on first search, enables instant subsequent lookups
+- **Index-based filtering** - avoids decoding games that don't match
 
 ## Installation
 
@@ -33,28 +56,34 @@ pip install -e .
 from pyscid import Database
 
 # Open any supported format (auto-detected)
+# This is instant - data is loaded lazily on demand
 db = Database.open("games.si4")
 
 # Get basic info
 print(f"Number of games: {len(db)}")
 print(f"Format: {db.format}")
 
-# Iterate through games
-for game in db:
-    print(f"{game.white} vs {game.black}: {game.result}")
+# Random access - only this game is loaded
+game = db[42]
+print(f"{game.white} vs {game.black}: {game.result}")
+
+# Browse the namebase to see what's in the database
+players = db.namebase.players
+print(f"Total players: {len(players)}")
+
+# Find a specific player
+magnus = [p for p in players if "Carlsen, Magnus" in p.name][0]
+print(f"Found: {magnus.name} (ID {magnus.id})")
+
+# Fast ID-based search (recommended)
+for game in db.search(player_id=magnus.id, year_min=2020):
+    print(f"{game.white} vs {game.black}")
     print(f"  Date: {game.date_string}")
     print(f"  ECO: {game.eco}")
-    
-    # Get moves
-    for move in game.moves[:10]:
-        print(f"  {move.uci()}")
 
-# Random access
-game = db[42]
-
-# Search games
-for game in db.search(player="Carlsen", year_min=2020):
-    print(game)
+# Get moves
+for move in game.moves[:10]:
+    print(f"  {move.uci()}")
 
 # Export to PGN
 print(game.to_pgn())
@@ -66,6 +95,22 @@ db.close()
 with Database.open("games.pgn") as db:
     for game in db:
         print(game)
+```
+
+### Loading Options
+
+```python
+# Default: lazy loading (instant open)
+db = Database.open("games.si4")
+
+# Preload everything (slower open, faster iteration)
+db = Database.open("games.si4", preload=True)
+
+# Preload just names (good for metadata browsing)
+db = Database.open("games.si4", preload_names=True)
+
+# Enable LRU cache for repeated random access
+db = Database.open("games.si4", cache_size=10000)
 ```
 
 ## Supported Data
@@ -114,8 +159,12 @@ Standard Portable Game Notation text format.
 ### Database
 
 ```python
-Database.open(filepath: str) -> Database
-    # Open a database file (auto-detects format)
+Database.open(
+    filepath: str,
+    preload: bool = False,       # Load all data upfront
+    preload_names: bool = False, # Load player/event names only
+    cache_size: int = 0          # LRU cache size for index entries
+) -> Database
 
 len(db) -> int
     # Number of games
@@ -127,8 +176,7 @@ for game in db:
     # Iterate through games
 
 db.search(**criteria) -> Iterator[Game]
-    # Search with criteria: white, black, player, event,
-    # site, year, year_min, year_max, result, eco, min_elo
+    # Search with criteria (see below)
 
 db.format -> str
     # 'si4', 'si5', or 'pgn'
@@ -136,9 +184,96 @@ db.format -> str
 db.description -> str
     # Database description (SI format only)
 
+db.preload_all()
+    # Explicitly load all data
+
+db.preload_namebase()
+    # Explicitly load name data
+
 db.close()
     # Release resources
+
+db.namebase
+    # Access namebase for browsing names (SI4/SI5 only)
 ```
+
+### NameBase Interface
+
+Browse all unique names in the database without loading games. Only available for SCID4/SCID5 formats.
+
+```python
+# Access the namebase
+players = db.namebase.players   # All player names
+events = db.namebase.events     # All event names
+sites = db.namebase.sites       # All site names
+rounds = db.namebase.rounds     # All round names
+
+# Each entry has an ID and name
+print(f"Total players: {len(players)}")
+for player in players[:10]:
+    print(f"ID {player.id}: {player.name}")
+
+# Find specific names
+magnus = [p for p in players if "Carlsen, Magnus" in p.name][0]
+print(f"Found: {magnus.name} (ID {magnus.id})")
+
+# Use ID for fast searches (much faster than name search)
+games = list(db.search(white_id=magnus.id))
+print(f"Found {len(games)} games")
+
+# ID-based searches work with all name types
+event = [e for e in events if "World Championship" in e.name][0]
+games = list(db.search(event_id=event.id))
+
+# Combine ID search with other criteria (very fast!)
+games = list(db.search(player_id=magnus.id, year=2020))
+```
+
+**Performance:** Browsing the namebase is fast because it only loads the compressed name file:
+- 580K players loaded in ~0.5 seconds
+- 237K events loaded in ~0.05 seconds
+- 82K sites loaded in ~0.02 seconds
+
+**ID-based searches are fastest:**
+- First ID search: ~10 seconds (builds player-game index)
+- Subsequent ID searches: 0.001-0.01 seconds (uses cached index)
+- Name-based searches: 0.5-1.5 seconds (requires name lookup)
+
+### Search Criteria
+
+```python
+db.search(
+    # Name-based searches (slower, partial match, case-insensitive)
+    white="Carlsen",      # White player name
+    black="Nakamura",     # Black player name
+    player="Carlsen",     # Either player name
+    event="Tata Steel",   # Event name
+    site="Wijk aan Zee",  # Site name
+    
+    # ID-based searches (fastest, exact match) - SI4/SI5 only
+    white_id=1324,        # White player ID (from db.namebase.players)
+    black_id=5678,        # Black player ID
+    player_id=1324,       # Either player ID
+    event_id=42,          # Event ID (from db.namebase.events)
+    site_id=99,           # Site ID (from db.namebase.sites)
+    
+    # Other criteria
+    year=2024,            # Exact year
+    year_min=2020,        # Minimum year
+    year_max=2024,        # Maximum year
+    result=Result.DRAW,   # Game result
+    eco="B90",            # ECO code prefix (e.g., "B", "B9", "B90")
+    min_elo=2700          # Minimum rating for either player
+)
+```
+
+All criteria are optional and combined with AND logic.
+
+**Search performance tips:**
+- Use ID-based searches when possible (10-100x faster than name searches)
+- Browse `db.namebase` to get IDs for players/events/sites
+- Combine ID searches with other criteria for maximum speed
+- Name searches build indexes on first use, making subsequent searches faster
 
 ### Game
 
