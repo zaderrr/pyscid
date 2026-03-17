@@ -12,7 +12,7 @@ Reference: scid/src/codec_scid4.cpp, scid/src/codec_scid4.h
 import struct
 import mmap
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, BinaryIO, Iterator
+from typing import List, Dict, Optional, Tuple, BinaryIO, Iterator, Set
 
 from .types import Result, RatingType, NameType
 from .game import IndexEntry, Game, Move
@@ -216,6 +216,73 @@ def read_index_header(f: BinaryIO) -> IndexHeader:
     return header
 
 
+def extract_search_fields(
+    data: bytes, version: int
+) -> Tuple[int, int, int, int, int, int, int, int, int]:
+    """
+    Fast extraction of search-relevant fields from an index entry.
+
+    Returns:
+        Tuple of (white_id, black_id, event_id, site_id, date, result, eco_code, white_elo, black_elo)
+
+    This is faster than full decode_index_entry() when you only need these fields.
+    """
+    # Skip offset (4 bytes), length (2-3 bytes), flags (2 bytes)
+    # For v4: offset=4, len_low=2, len_flags=1, flags=2 = 9 bytes
+    # For v3: offset=4, len_low=2, flags=2 = 8 bytes
+    pos = 9 if version >= 400 else 8
+
+    # WhiteID and BlackID (20-bit each, packed in 5 bytes)
+    white_black_high = data[pos]
+    white_id_low = (data[pos + 1] << 8) | data[pos + 2]
+    white_id = ((white_black_high & 0xF0) << 12) | white_id_low
+    black_id_low = (data[pos + 3] << 8) | data[pos + 4]
+    black_id = ((white_black_high & 0x0F) << 16) | black_id_low
+    pos += 5
+
+    # EventID (19-bit), SiteID (19-bit), RoundID (18-bit) - 7 bytes
+    event_site_rnd_high = data[pos]
+    event_id_low = (data[pos + 1] << 8) | data[pos + 2]
+    event_id = ((event_site_rnd_high & 0xE0) << 11) | event_id_low
+    site_id_low = (data[pos + 3] << 8) | data[pos + 4]
+    site_id = ((event_site_rnd_high & 0x1C) << 14) | site_id_low
+    pos += 7  # Skip round_id too
+
+    # Result (in var_counts, bits 12-15) - 2 bytes
+    var_counts = (data[pos] << 8) | data[pos + 1]
+    result = (var_counts >> 12) & 0x0F
+    pos += 2
+
+    # ECO code - 2 bytes
+    eco_code = (data[pos] << 8) | data[pos + 1]
+    pos += 2
+
+    # Date (lower 20 bits of 4-byte packed date/eventdate)
+    date = (
+        (data[pos] << 24) | (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3]
+    ) & 0xFFFFF
+    pos += 4
+
+    # White ELO (lower 12 bits) - 2 bytes
+    white_elo = ((data[pos] << 8) | data[pos + 1]) & 0xFFF
+    pos += 2
+
+    # Black ELO (lower 12 bits) - 2 bytes
+    black_elo = ((data[pos] << 8) | data[pos + 1]) & 0xFFF
+
+    return (
+        white_id,
+        black_id,
+        event_id,
+        site_id,
+        date,
+        result,
+        eco_code,
+        white_elo,
+        black_elo,
+    )
+
+
 def decode_index_entry(data: bytes, version: int) -> IndexEntry:
     """
     Decode a 47-byte (v4) or 46-byte (v3) index entry.
@@ -386,6 +453,10 @@ class Scid4Database:
         self._cache_size: int = 0
         # For preloaded mode: store all entries in a list
         self._preloaded_entries: Optional[List[IndexEntry]] = None
+        # Lazy-built name indexes for fast search: name (lowercase) -> ID
+        self._player_name_index: Optional[Dict[str, int]] = None
+        self._event_name_index: Optional[Dict[str, int]] = None
+        self._site_name_index: Optional[Dict[str, int]] = None
 
     @staticmethod
     def open(
@@ -650,6 +721,252 @@ class Scid4Database:
         """
         ie = self.get_index_entry(game_num)
         return self._get_game_from_entry(ie)
+
+    # -------------------------------------------------------------------------
+    # Search optimization: name indexes
+    # -------------------------------------------------------------------------
+
+    def _ensure_player_index(self):
+        """Build player name -> ID index on first use"""
+        if self._player_name_index is not None:
+            return
+        self._ensure_namebase_loaded()
+        if self.namebase is None:
+            return
+        self._player_name_index = {
+            name.lower(): pid
+            for pid, name in enumerate(self.namebase.names[NameType.PLAYER])
+        }
+
+    def _ensure_event_index(self):
+        """Build event name -> ID index on first use"""
+        if self._event_name_index is not None:
+            return
+        self._ensure_namebase_loaded()
+        if self.namebase is None:
+            return
+        self._event_name_index = {
+            name.lower(): eid
+            for eid, name in enumerate(self.namebase.names[NameType.EVENT])
+        }
+
+    def _ensure_site_index(self):
+        """Build site name -> ID index on first use"""
+        if self._site_name_index is not None:
+            return
+        self._ensure_namebase_loaded()
+        if self.namebase is None:
+            return
+        self._site_name_index = {
+            name.lower(): sid
+            for sid, name in enumerate(self.namebase.names[NameType.SITE])
+        }
+
+    def _find_matching_player_ids(self, search_term: str) -> Set[int]:
+        """Find all player IDs where name contains search_term (case-insensitive)"""
+        self._ensure_player_index()
+        if self._player_name_index is None:
+            return set()
+        term = search_term.lower()
+        return {pid for name, pid in self._player_name_index.items() if term in name}
+
+    def _find_matching_event_ids(self, search_term: str) -> Set[int]:
+        """Find all event IDs where name contains search_term (case-insensitive)"""
+        self._ensure_event_index()
+        if self._event_name_index is None:
+            return set()
+        term = search_term.lower()
+        return {eid for name, eid in self._event_name_index.items() if term in name}
+
+    def _find_matching_site_ids(self, search_term: str) -> Set[int]:
+        """Find all site IDs where name contains search_term (case-insensitive)"""
+        self._ensure_site_index()
+        if self._site_name_index is None:
+            return set()
+        term = search_term.lower()
+        return {sid for name, sid in self._site_name_index.items() if term in name}
+
+    def search(self, **criteria) -> Iterator[Game]:
+        """
+        Search for games matching the given criteria.
+
+        This is an optimized search that filters on IndexEntry fields first
+        (fast integer comparisons), then only decodes games that match.
+
+        Supported criteria:
+            white: str - White player name (partial match, case-insensitive)
+            black: str - Black player name (partial match, case-insensitive)
+            player: str - Either player (partial match, case-insensitive)
+            event: str - Event name (partial match, case-insensitive)
+            site: str - Site name (partial match, case-insensitive)
+            year: int - Game year (exact match)
+            year_min: int - Minimum year
+            year_max: int - Maximum year
+            result: Result - Game result (exact match)
+            eco: str - ECO code prefix
+            min_elo: int - Minimum rating for either player
+
+        Yields:
+            Game objects matching all criteria
+        """
+        # Build ID sets for name-based criteria (only if that criterion is used)
+        white_ids: Optional[Set[int]] = None
+        black_ids: Optional[Set[int]] = None
+        player_ids: Optional[Set[int]] = None
+        event_ids: Optional[Set[int]] = None
+        site_ids: Optional[Set[int]] = None
+
+        if criteria.get("white"):
+            white_ids = self._find_matching_player_ids(criteria["white"])
+            if not white_ids:
+                return  # No matching players, no results
+
+        if criteria.get("black"):
+            black_ids = self._find_matching_player_ids(criteria["black"])
+            if not black_ids:
+                return
+
+        if criteria.get("player"):
+            player_ids = self._find_matching_player_ids(criteria["player"])
+            if not player_ids:
+                return
+
+        if criteria.get("event"):
+            event_ids = self._find_matching_event_ids(criteria["event"])
+            if not event_ids:
+                return
+
+        if criteria.get("site"):
+            site_ids = self._find_matching_site_ids(criteria["site"])
+            if not site_ids:
+                return
+
+        # Direct IndexEntry filters (no name lookup needed)
+        year = criteria.get("year")
+        year_min = criteria.get("year_min")
+        year_max = criteria.get("year_max")
+        result_filter = criteria.get("result")
+        eco_prefix = criteria.get("eco", "").upper()
+        min_elo = criteria.get("min_elo", 0)
+
+        # Convert result enum to int for fast comparison
+        result_int = result_filter.value if result_filter is not None else None
+
+        # Convert ECO prefix to numeric range for fast comparison
+        eco_code_min = eco_code_max = None
+        if eco_prefix:
+            eco_code_min, eco_code_max = self._eco_prefix_to_range(eco_prefix)
+
+        # Fast scan using extract_search_fields instead of full decode
+        if self._index_mmap is None or self.header is None:
+            return
+
+        version = self.header.version
+        entry_size = self._entry_size
+        header_size = INDEX_HEADER_SIZE
+        num_games = len(self)
+        index_mmap = self._index_mmap
+
+        for game_num in range(num_games):
+            offset = header_size + (game_num * entry_size)
+            data = index_mmap[offset : offset + entry_size]
+
+            # Fast extraction of search fields
+            (
+                white_id,
+                black_id,
+                event_id,
+                site_id,
+                date,
+                result,
+                eco_code,
+                white_elo,
+                black_elo,
+            ) = extract_search_fields(data, version)
+
+            # Filter on player IDs
+            if white_ids is not None and white_id not in white_ids:
+                continue
+            if black_ids is not None and black_id not in black_ids:
+                continue
+            if player_ids is not None:
+                if white_id not in player_ids and black_id not in player_ids:
+                    continue
+
+            # Filter on event/site IDs
+            if event_ids is not None and event_id not in event_ids:
+                continue
+            if site_ids is not None and site_id not in site_ids:
+                continue
+
+            # Filter on date (extract year from packed date)
+            if year or year_min or year_max:
+                game_year = (date >> 9) & 0x7FF
+                if year and game_year != year:
+                    continue
+                if year_min and game_year < year_min:
+                    continue
+                if year_max and game_year > year_max:
+                    continue
+
+            # Filter on result
+            if result_int is not None and result != result_int:
+                continue
+
+            # Filter on ECO (numeric comparison)
+            if eco_code_min is not None and eco_code_max is not None:
+                if eco_code < eco_code_min or eco_code > eco_code_max:
+                    continue
+
+            # Filter on ELO
+            if min_elo > 0:
+                if white_elo < min_elo and black_elo < min_elo:
+                    continue
+
+            # Passed all filters - get full index entry and decode game
+            ie = self.get_index_entry(game_num)
+            yield self._get_game_from_entry(ie)
+
+    def _eco_prefix_to_range(self, prefix: str) -> Tuple[int, int]:
+        """
+        Convert an ECO prefix (e.g., "B", "B9", "B90") to a numeric range.
+
+        SCID ECO encoding: ((letter - 'A') * 100 + number) * 4 + subcode
+        E.g., B90 = (1 * 100 + 90) * 4 = 760 (without subcode)
+              B90a = 760 + 1 = 761
+        """
+        if not prefix:
+            return (0, 2000)  # All ECO codes (E99d = 499*4+3 = 1999)
+
+        prefix = prefix.upper()
+        letter = prefix[0]
+        if letter < "A" or letter > "E":
+            return (0, 2000)
+
+        letter_val = ord(letter) - ord("A")
+
+        if len(prefix) == 1:
+            # Just letter: e.g., "B" -> B00-B99 (all subcodes)
+            base_min = (letter_val * 100 + 0) * 4
+            base_max = (letter_val * 100 + 99) * 4 + 3
+            return (base_min, base_max)
+        elif len(prefix) == 2:
+            # Letter + one digit: e.g., "B9" -> B90-B99 (all subcodes)
+            try:
+                digit = int(prefix[1])
+                base_min = (letter_val * 100 + digit * 10) * 4
+                base_max = (letter_val * 100 + digit * 10 + 9) * 4 + 3
+                return (base_min, base_max)
+            except ValueError:
+                return (0, 2000)
+        else:
+            # Full code: e.g., "B90" -> B90 with all subcodes (B90, B90a, B90b, B90c, B90d)
+            try:
+                num = int(prefix[1:3])
+                base = (letter_val * 100 + num) * 4
+                return (base, base + 3)  # Include all subcodes
+            except ValueError:
+                return (0, 2000)
 
     def _decode_game_data(self, game: Game, data: bytes, ie: IndexEntry):
         """

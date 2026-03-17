@@ -19,7 +19,7 @@ Reference: scid/src/codec_scid5.h
 import struct
 import mmap
 from pathlib import Path
-from typing import List, Dict, Optional, Iterator, BinaryIO
+from typing import List, Dict, Optional, Iterator, BinaryIO, Set, Tuple
 
 from .types import Result, RatingType, NameType
 from .game import IndexEntry, Game, Move
@@ -157,6 +157,59 @@ def _read_varint(data: bytes, pos: int) -> tuple:
         shift += 7
 
     return None, pos
+
+
+def extract_search_fields_v5(
+    data: bytes,
+) -> Tuple[int, int, int, int, int, int, int, int, int]:
+    """
+    Fast extraction of search-relevant fields from a SCID5 index entry.
+
+    Returns:
+        Tuple of (white_id, black_id, event_id, site_id, date, result, eco_code, white_elo, black_elo)
+
+    This is faster than full decode_index_entry_v5() when you only need these fields.
+    """
+    # Word 0: nComments(4) + whiteID(28)
+    val = struct.unpack_from("<I", data, 0)[0]
+    white_id = val & 0x0FFFFFFF
+
+    # Word 1: nVariations(4) + blackID(28)
+    val = struct.unpack_from("<I", data, 4)[0]
+    black_id = val & 0x0FFFFFFF
+
+    # Word 2: nNags(4) + eventID(28)
+    val = struct.unpack_from("<I", data, 8)[0]
+    event_id = val & 0x0FFFFFFF
+
+    # Word 3: siteID(32)
+    site_id = struct.unpack_from("<I", data, 12)[0]
+
+    # Word 5: whiteElo(12) + date(20)
+    val = struct.unpack_from("<I", data, 20)[0]
+    white_elo = val >> 20
+    date = val & 0xFFFFF
+
+    # Word 6: blackElo(12) + eventDate(20)
+    val = struct.unpack_from("<I", data, 24)[0]
+    black_elo = val >> 20
+
+    # Word 11: (homePawnCount(8) + ratingTypes(6) + result(2))(16) + ecoCode(16)
+    val = struct.unpack_from("<I", data, 44)[0]
+    result = (val >> 16) & 0x03
+    eco_code = val & 0xFFFF
+
+    return (
+        white_id,
+        black_id,
+        event_id,
+        site_id,
+        date,
+        result,
+        eco_code,
+        white_elo,
+        black_elo,
+    )
 
 
 def decode_index_entry_v5(data: bytes) -> IndexEntry:
@@ -298,6 +351,10 @@ class Scid5Database:
         self._cache_size: int = 0
         # For preloaded mode: store all entries in a list
         self._preloaded_entries: Optional[List[IndexEntry]] = None
+        # Lazy-built name indexes for fast search: name (lowercase) -> ID
+        self._player_name_index: Optional[Dict[str, int]] = None
+        self._event_name_index: Optional[Dict[str, int]] = None
+        self._site_name_index: Optional[Dict[str, int]] = None
 
     @property
     def description(self) -> str:
@@ -568,3 +625,241 @@ class Scid5Database:
         """
         ie = self.get_index_entry(game_num)
         return self._get_game_from_entry(ie)
+
+    # -------------------------------------------------------------------------
+    # Search optimization: name indexes
+    # -------------------------------------------------------------------------
+
+    def _ensure_player_index(self):
+        """Build player name -> ID index on first use"""
+        if self._player_name_index is not None:
+            return
+        self._ensure_namebase_loaded()
+        if self.namebase is None:
+            return
+        self._player_name_index = {
+            name.lower(): pid
+            for pid, name in enumerate(self.namebase.names[NameType.PLAYER])
+        }
+
+    def _ensure_event_index(self):
+        """Build event name -> ID index on first use"""
+        if self._event_name_index is not None:
+            return
+        self._ensure_namebase_loaded()
+        if self.namebase is None:
+            return
+        self._event_name_index = {
+            name.lower(): eid
+            for eid, name in enumerate(self.namebase.names[NameType.EVENT])
+        }
+
+    def _ensure_site_index(self):
+        """Build site name -> ID index on first use"""
+        if self._site_name_index is not None:
+            return
+        self._ensure_namebase_loaded()
+        if self.namebase is None:
+            return
+        self._site_name_index = {
+            name.lower(): sid
+            for sid, name in enumerate(self.namebase.names[NameType.SITE])
+        }
+
+    def _find_matching_player_ids(self, search_term: str) -> Set[int]:
+        """Find all player IDs where name contains search_term (case-insensitive)"""
+        self._ensure_player_index()
+        if self._player_name_index is None:
+            return set()
+        term = search_term.lower()
+        return {pid for name, pid in self._player_name_index.items() if term in name}
+
+    def _find_matching_event_ids(self, search_term: str) -> Set[int]:
+        """Find all event IDs where name contains search_term (case-insensitive)"""
+        self._ensure_event_index()
+        if self._event_name_index is None:
+            return set()
+        term = search_term.lower()
+        return {eid for name, eid in self._event_name_index.items() if term in name}
+
+    def _find_matching_site_ids(self, search_term: str) -> Set[int]:
+        """Find all site IDs where name contains search_term (case-insensitive)"""
+        self._ensure_site_index()
+        if self._site_name_index is None:
+            return set()
+        term = search_term.lower()
+        return {sid for name, sid in self._site_name_index.items() if term in name}
+
+    def search(self, **criteria) -> Iterator[Game]:
+        """
+        Search for games matching the given criteria.
+
+        This is an optimized search that filters on IndexEntry fields first
+        (fast integer comparisons), then only decodes games that match.
+
+        Supported criteria:
+            white: str - White player name (partial match, case-insensitive)
+            black: str - Black player name (partial match, case-insensitive)
+            player: str - Either player (partial match, case-insensitive)
+            event: str - Event name (partial match, case-insensitive)
+            site: str - Site name (partial match, case-insensitive)
+            year: int - Game year (exact match)
+            year_min: int - Minimum year
+            year_max: int - Maximum year
+            result: Result - Game result (exact match)
+            eco: str - ECO code prefix
+            min_elo: int - Minimum rating for either player
+
+        Yields:
+            Game objects matching all criteria
+        """
+        # Build ID sets for name-based criteria (only if that criterion is used)
+        white_ids: Optional[Set[int]] = None
+        black_ids: Optional[Set[int]] = None
+        player_ids: Optional[Set[int]] = None
+        event_ids: Optional[Set[int]] = None
+        site_ids: Optional[Set[int]] = None
+
+        if criteria.get("white"):
+            white_ids = self._find_matching_player_ids(criteria["white"])
+            if not white_ids:
+                return  # No matching players, no results
+
+        if criteria.get("black"):
+            black_ids = self._find_matching_player_ids(criteria["black"])
+            if not black_ids:
+                return
+
+        if criteria.get("player"):
+            player_ids = self._find_matching_player_ids(criteria["player"])
+            if not player_ids:
+                return
+
+        if criteria.get("event"):
+            event_ids = self._find_matching_event_ids(criteria["event"])
+            if not event_ids:
+                return
+
+        if criteria.get("site"):
+            site_ids = self._find_matching_site_ids(criteria["site"])
+            if not site_ids:
+                return
+
+        # Direct IndexEntry filters (no name lookup needed)
+        year = criteria.get("year")
+        year_min = criteria.get("year_min")
+        year_max = criteria.get("year_max")
+        result_filter = criteria.get("result")
+        eco_prefix = criteria.get("eco", "").upper()
+        min_elo = criteria.get("min_elo", 0)
+
+        # Convert result enum to int for fast comparison
+        result_int = result_filter.value if result_filter is not None else None
+
+        # Convert ECO prefix to numeric range for fast comparison
+        eco_code_min = eco_code_max = None
+        if eco_prefix:
+            eco_code_min, eco_code_max = self._eco_prefix_to_range(eco_prefix)
+
+        # Fast scan using extract_search_fields_v5 instead of full decode
+        if self._index_mmap is None:
+            return
+
+        num_games = len(self)
+        index_mmap = self._index_mmap
+
+        for game_num in range(num_games):
+            offset = game_num * INDEX_ENTRY_SIZE
+            data = index_mmap[offset : offset + INDEX_ENTRY_SIZE]
+
+            # Fast extraction of search fields
+            (
+                white_id,
+                black_id,
+                event_id,
+                site_id,
+                date,
+                result,
+                eco_code,
+                white_elo,
+                black_elo,
+            ) = extract_search_fields_v5(data)
+
+            # Filter on player IDs
+            if white_ids is not None and white_id not in white_ids:
+                continue
+            if black_ids is not None and black_id not in black_ids:
+                continue
+            if player_ids is not None:
+                if white_id not in player_ids and black_id not in player_ids:
+                    continue
+
+            # Filter on event/site IDs
+            if event_ids is not None and event_id not in event_ids:
+                continue
+            if site_ids is not None and site_id not in site_ids:
+                continue
+
+            # Filter on date (extract year from packed date)
+            if year or year_min or year_max:
+                game_year = (date >> 9) & 0x7FF
+                if year and game_year != year:
+                    continue
+                if year_min and game_year < year_min:
+                    continue
+                if year_max and game_year > year_max:
+                    continue
+
+            # Filter on result
+            if result_int is not None and result != result_int:
+                continue
+
+            # Filter on ECO (numeric comparison)
+            if eco_code_min is not None and eco_code_max is not None:
+                if eco_code < eco_code_min or eco_code > eco_code_max:
+                    continue
+
+            # Filter on ELO
+            if min_elo > 0:
+                if white_elo < min_elo and black_elo < min_elo:
+                    continue
+
+            # Passed all filters - get full index entry and decode game
+            ie = self.get_index_entry(game_num)
+            yield self._get_game_from_entry(ie)
+
+    def _eco_prefix_to_range(self, prefix: str) -> Tuple[int, int]:
+        """
+        Convert an ECO prefix (e.g., "B", "B9", "B90") to a numeric range.
+
+        SCID ECO encoding: ((letter - 'A') * 100 + number) * 4 + subcode
+        """
+        if not prefix:
+            return (0, 2000)
+
+        prefix = prefix.upper()
+        letter = prefix[0]
+        if letter < "A" or letter > "E":
+            return (0, 2000)
+
+        letter_val = ord(letter) - ord("A")
+
+        if len(prefix) == 1:
+            base_min = (letter_val * 100 + 0) * 4
+            base_max = (letter_val * 100 + 99) * 4 + 3
+            return (base_min, base_max)
+        elif len(prefix) == 2:
+            try:
+                digit = int(prefix[1])
+                base_min = (letter_val * 100 + digit * 10) * 4
+                base_max = (letter_val * 100 + digit * 10 + 9) * 4 + 3
+                return (base_min, base_max)
+            except ValueError:
+                return (0, 2000)
+        else:
+            try:
+                num = int(prefix[1:3])
+                base = (letter_val * 100 + num) * 4
+                return (base, base + 3)
+            except ValueError:
+                return (0, 2000)

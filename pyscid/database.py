@@ -303,13 +303,19 @@ class Database:
         """
         Search for games matching the given criteria.
 
+        For SCID formats (.si4, .si5), this uses an optimized search that
+        filters on index entries first, avoiding full game decoding until
+        a match is found. Name indexes are built lazily on first search.
+
+        For PGN format, falls back to iterating through all games.
+
         Supported criteria:
-            white: str - Player name (partial match)
-            black: str - Player name (partial match)
-            player: str - Either player (partial match)
-            event: str - Event name (partial match)
-            site: str - Site name (partial match)
-            year: int - Game year
+            white: str - Player name (partial match, case-insensitive)
+            black: str - Player name (partial match, case-insensitive)
+            player: str - Either player (partial match, case-insensitive)
+            event: str - Event name (partial match, case-insensitive)
+            site: str - Site name (partial match, case-insensitive)
+            year: int - Game year (exact match)
             year_min: int - Minimum year
             year_max: int - Maximum year
             result: Result - Game result
@@ -318,6 +324,19 @@ class Database:
 
         Yields:
             Game objects matching all criteria
+        """
+        # Use optimized backend search for SCID formats
+        if isinstance(self._backend, (Scid4Database, Scid5Database)):
+            yield from self._backend.search(**criteria)
+        else:
+            # PGN fallback - iterate through all games
+            yield from self._search_slow(**criteria)
+
+    def _search_slow(self, **criteria) -> Iterator[Game]:
+        """
+        Slow search implementation for PGN databases.
+
+        Iterates through all games and checks each criterion.
         """
         white = criteria.get("white", "").lower()
         black = criteria.get("black", "").lower()
