@@ -110,6 +110,10 @@ class Board:
 
     SCID assigns each piece an index (0-15) per color. The King always has index 0.
     Moves are encoded as (piece_index, move_code) pairs.
+
+    IMPORTANT: When a piece is captured, the LAST active piece in the list
+    is swapped into the captured piece's index slot. This means piece indices
+    can change during the game!
     """
 
     def __init__(self):
@@ -132,6 +136,9 @@ class Board:
         # En passant square (or None)
         self.ep_square: Optional[int] = None
 
+        # Number of active pieces per color (for SCID index swapping on capture)
+        self.piece_count: List[int] = [16, 16]
+
     @staticmethod
     def standard() -> "Board":
         """Create board with standard starting position"""
@@ -148,6 +155,7 @@ class Board:
         self.can_castle_kingside = [True, True]
         self.can_castle_queenside = [True, True]
         self.ep_square = None
+        self.piece_count = [16, 16]
 
         # White pieces (index 0 = King, then left-to-right excluding king)
         # Standard order: Ra1=1, Nb1=2, Bc1=3, Qd1=4, Ke1=0, Bf1=5, Ng1=6, Rh1=7
@@ -215,6 +223,7 @@ class Board:
         self.can_castle_kingside = [False, False]
         self.can_castle_queenside = [False, False]
         self.ep_square = None
+        self.piece_count = [0, 0]
 
         parts = fen.split()
         if len(parts) < 1:
@@ -249,6 +258,9 @@ class Board:
                         king_at_index[color] = idx
 
                     file_idx += 1
+
+        # Set piece counts
+        self.piece_count = [piece_indices[Color.WHITE], piece_indices[Color.BLACK]]
 
         # Swap king to index 0 if not already there
         for color in [Color.WHITE, Color.BLACK]:
@@ -300,6 +312,35 @@ class Board:
             return None
         return (color, index, piece.piece_type)
 
+    def _handle_capture(self, cap_color: Color, cap_index: int):
+        """
+        Handle a piece capture by swapping indices.
+
+        SCID maintains a compact list of active pieces. When a piece is captured,
+        the LAST active piece is moved into the captured piece's index slot.
+        This keeps indices 0..count-1 always valid.
+        """
+        cap_piece = self.pieces[cap_color][cap_index]
+        if cap_piece is None:
+            return
+
+        cap_piece.captured = True
+
+        # Decrease the piece count
+        self.piece_count[cap_color] -= 1
+        last_index = self.piece_count[cap_color]
+
+        # If the captured piece wasn't the last one, swap
+        if cap_index != last_index:
+            last_piece = self.pieces[cap_color][last_index]
+            if last_piece and not last_piece.captured:
+                # Move last piece to captured index
+                self.pieces[cap_color][cap_index] = last_piece
+                self.pieces[cap_color][last_index] = cap_piece  # Move captured to end
+
+                # Update board reference for the swapped piece
+                self.board[last_piece.square] = (cap_color, cap_index)
+
     def make_move(self, from_sq: int, to_sq: int, promotion: Optional[Piece] = None):
         """
         Make a move on the board, updating piece positions.
@@ -313,13 +354,11 @@ class Board:
         if piece is None:
             return
 
-        # Handle capture
+        # Handle capture - SCID swaps the last active piece into the captured index
         target = self.board[to_sq]
         if target is not None:
             cap_color, cap_index = target
-            cap_piece = self.pieces[cap_color][cap_index]
-            if cap_piece:
-                cap_piece.captured = True
+            self._handle_capture(cap_color, cap_index)
             self.board[to_sq] = None
 
         # Handle en passant capture
@@ -329,9 +368,7 @@ class Board:
             ep_target = self.board[ep_capture_sq]
             if ep_target is not None:
                 ep_color, ep_index = ep_target
-                ep_piece = self.pieces[ep_color][ep_index]
-                if ep_piece:
-                    ep_piece.captured = True
+                self._handle_capture(ep_color, ep_index)
                 self.board[ep_capture_sq] = None
 
         # Clear en passant

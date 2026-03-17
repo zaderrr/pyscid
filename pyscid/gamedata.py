@@ -308,7 +308,7 @@ def _decode_single_move(
         to_sq = _decode_rook_move(from_sq, move_code)
 
     elif piece_type == Piece.BISHOP:
-        to_sq = _decode_bishop_move(from_sq, move_code)
+        to_sq = _decode_bishop_move(from_sq, move_code, color)
 
     elif piece_type == Piece.KNIGHT:
         to_sq = _decode_knight_move(from_sq, move_code)
@@ -345,30 +345,34 @@ def _decode_rook_move(from_sq: int, move_code: int) -> int:
         return Square.make(move_code, Square.rank(from_sq))
 
 
-def _decode_bishop_move(from_sq: int, move_code: int) -> int:
+def _decode_bishop_move(from_sq: int, move_code: int, color: Color) -> int:
     """
     Decode bishop move.
 
     The move_code encodes the destination file.
-    move_code 0-7: up-right diagonal (rank increases with file)
-    move_code 8-15: down-right diagonal (rank decreases with file)
+    move_code 0-7: main diagonal (rank changes same direction as file)
+    move_code 8-15: anti-diagonal (rank changes opposite direction to file)
     """
     from_file = Square.file(from_sq)
     from_rank = Square.rank(from_sq)
 
     if move_code >= 8:
-        # "Down-right" diagonal: file increases, rank decreases (from white's view)
-        # Actually this is the anti-diagonal
+        # Anti-diagonal
         dest_file = move_code - 8
         file_diff = dest_file - from_file
-        to_sq = from_sq - 7 * file_diff
+        # Anti-diagonal: rank changes opposite to file
+        dest_rank = from_rank - file_diff
     else:
-        # "Up-right" diagonal: file increases, rank increases
+        # Main diagonal
         dest_file = move_code
         file_diff = dest_file - from_file
-        to_sq = from_sq + 9 * file_diff
+        # Main diagonal: rank changes same as file
+        dest_rank = from_rank + file_diff
 
-    return to_sq
+    if not (0 <= dest_rank <= 7):
+        return -1  # Invalid square
+
+    return Square.make(dest_file, dest_rank)
 
 
 def _decode_knight_move(from_sq: int, move_code: int) -> int:
@@ -376,13 +380,33 @@ def _decode_knight_move(from_sq: int, move_code: int) -> int:
     Decode knight move.
 
     move_code 1-8 encodes the 8 possible knight destinations.
+    The offsets are ordered by destination square value.
     """
-    # Knight move offsets for move codes 1-8
-    knight_offsets = [0, -17, -15, -10, -6, 6, 10, 15, 17]
+    # Knight move deltas: (file_delta, rank_delta) for move codes 1-8
+    # Ordered by resulting square offset: -17, -15, -10, -6, +6, +10, +15, +17
+    knight_deltas = [
+        (0, 0),  # 0: unused
+        (-1, -2),  # 1: offset -17
+        (1, -2),  # 2: offset -15
+        (-2, -1),  # 3: offset -10
+        (2, -1),  # 4: offset -6
+        (-2, 1),  # 5: offset +6
+        (2, 1),  # 6: offset +10
+        (-1, 2),  # 7: offset +15
+        (1, 2),  # 8: offset +17
+    ]
 
     if 1 <= move_code <= 8:
-        return from_sq + knight_offsets[move_code]
-    return from_sq
+        from_file = Square.file(from_sq)
+        from_rank = Square.rank(from_sq)
+        file_delta, rank_delta = knight_deltas[move_code]
+        dest_file = from_file + file_delta
+        dest_rank = from_rank + rank_delta
+
+        if 0 <= dest_file <= 7 and 0 <= dest_rank <= 7:
+            return Square.make(dest_file, dest_rank)
+
+    return -1  # Invalid move
 
 
 def _decode_pawn_move(

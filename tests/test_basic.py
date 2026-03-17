@@ -104,6 +104,129 @@ class TestMove:
         assert str(move) == "--"
 
 
+class TestMoveDecoding:
+    """Test internal move decoding functions"""
+
+    def test_bishop_move_decode_main_diagonal(self):
+        """Test bishop move decoding for main diagonal (move_code 0-7)."""
+        from pyscid.gamedata import _decode_bishop_move
+
+        # Bishop on e4 (square 28, file 4, rank 3)
+        from_sq = Square.E4
+
+        # Up-right along main diagonal: e4 to h7 (move_code = 7 for h-file)
+        to_sq = _decode_bishop_move(from_sq, 7, Color.WHITE)
+        assert to_sq == Square.H7, f"Expected h7, got {Square.name(to_sq)}"
+
+        # Down-left along main diagonal: e4 to b1 (move_code = 1 for b-file)
+        to_sq = _decode_bishop_move(from_sq, 1, Color.WHITE)
+        assert to_sq == Square.B1, f"Expected b1, got {Square.name(to_sq)}"
+
+        # Single step up-right: e4 to f5 (move_code = 5 for f-file)
+        to_sq = _decode_bishop_move(from_sq, 5, Color.WHITE)
+        assert to_sq == Square.F5, f"Expected f5, got {Square.name(to_sq)}"
+
+    def test_bishop_move_decode_anti_diagonal(self):
+        """Test bishop move decoding for anti-diagonal (move_code 8-15)."""
+        from pyscid.gamedata import _decode_bishop_move
+
+        # Bishop on e4 (square 28, file 4, rank 3)
+        from_sq = Square.E4
+
+        # Down-right along anti-diagonal: e4 to h1 (move_code = 8+7 = 15)
+        to_sq = _decode_bishop_move(from_sq, 15, Color.WHITE)
+        assert to_sq == Square.H1, f"Expected h1, got {Square.name(to_sq)}"
+
+        # Up-left along anti-diagonal: e4 to b7 (move_code = 8+1 = 9)
+        to_sq = _decode_bishop_move(from_sq, 9, Color.WHITE)
+        assert to_sq == Square.B7, f"Expected b7, got {Square.name(to_sq)}"
+
+        # Single step down-right: e4 to f3 (move_code = 8+5 = 13)
+        to_sq = _decode_bishop_move(from_sq, 13, Color.WHITE)
+        assert to_sq == Square.F3, f"Expected f3, got {Square.name(to_sq)}"
+
+    def test_bishop_move_same_file_stays_put(self):
+        """Test bishop with same file destination returns correct square"""
+        from pyscid.gamedata import _decode_bishop_move
+
+        # Bishop on d4, move_code = 3 (d-file) means no movement on main diagonal
+        # This should return d4 itself
+        from_sq = Square.D4
+        to_sq = _decode_bishop_move(from_sq, 3, Color.WHITE)
+        assert to_sq == Square.D4
+
+    def test_knight_move_decode_all_directions(self):
+        """Test knight move decoding for all 8 directions"""
+        from pyscid.gamedata import _decode_knight_move
+
+        # Knight on e4 (square 28, file 4, rank 3)
+        from_sq = Square.E4
+
+        # Test all 8 knight moves from e4
+        expected = [
+            (1, Square.D2),  # -1 file, -2 rank
+            (2, Square.F2),  # +1 file, -2 rank
+            (3, Square.C3),  # -2 file, -1 rank
+            (4, Square.G3),  # +2 file, -1 rank
+            (5, Square.C5),  # -2 file, +1 rank
+            (6, Square.G5),  # +2 file, +1 rank
+            (7, Square.D6),  # -1 file, +2 rank
+            (8, Square.F6),  # +1 file, +2 rank
+        ]
+
+        for move_code, expected_sq in expected:
+            to_sq = _decode_knight_move(from_sq, move_code)
+            assert to_sq == expected_sq, (
+                f"move_code {move_code}: expected {Square.name(expected_sq)}, got {Square.name(to_sq)}"
+            )
+
+    def test_knight_move_edge_detection(self):
+        """Test knight moves that would go off the board return invalid"""
+        from pyscid.gamedata import _decode_knight_move
+
+        # Knight on a1 - only 2 valid knight moves
+        from_sq = Square.A1
+        valid_moves = 0
+        for move_code in range(1, 9):
+            to_sq = _decode_knight_move(from_sq, move_code)
+            if Square.is_valid(to_sq):
+                valid_moves += 1
+        # From a1, knight can only go to b3 or c2
+        assert valid_moves == 2, f"Expected 2 valid moves from a1, got {valid_moves}"
+
+        # Knight on h8 - only 2 valid knight moves
+        from_sq = Square.H8
+        valid_moves = 0
+        for move_code in range(1, 9):
+            to_sq = _decode_knight_move(from_sq, move_code)
+            if Square.is_valid(to_sq):
+                valid_moves += 1
+        assert valid_moves == 2, f"Expected 2 valid moves from h8, got {valid_moves}"
+
+    def test_rook_move_decode(self):
+        """Test rook move decoding"""
+        from pyscid.gamedata import _decode_rook_move
+
+        # Rook on e4
+        from_sq = Square.E4
+
+        # Horizontal to a4 (move_code = 0 for a-file)
+        to_sq = _decode_rook_move(from_sq, 0)
+        assert to_sq == Square.A4
+
+        # Horizontal to h4 (move_code = 7 for h-file)
+        to_sq = _decode_rook_move(from_sq, 7)
+        assert to_sq == Square.H4
+
+        # Vertical to e1 (move_code = 8 + 0 = 8 for rank 1)
+        to_sq = _decode_rook_move(from_sq, 8)
+        assert to_sq == Square.E1
+
+        # Vertical to e8 (move_code = 8 + 7 = 15 for rank 8)
+        to_sq = _decode_rook_move(from_sq, 15)
+        assert to_sq == Square.E8
+
+
 class TestPgnParsing:
     """Test PGN parsing"""
 

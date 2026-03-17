@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyscid"
-version = "0.1.0"
+version = "0.2.0"
 description = "A pure Python library for reading SCID chess database files"
 readme = "README.md"
 requires-python = ">=3.8"
