@@ -21,11 +21,17 @@ Benchmarks on a 10 million game database:
 | Operation | Time |
 |-----------|------|
 | Open database | **0.1 ms** |
-| Search by player name | **8 seconds** |
+| First player search | **11 seconds** (builds index) |
+| Subsequent player searches | **0.5 - 1.5 seconds** |
+| Combined search (player + year) | **0.07 seconds** |
 | Access single game | **0.1 ms** |
 | Iterate 10,000 games | **1.4 seconds** |
 
-The library uses lazy loading and memory-mapped files to achieve instant database opening. Search operations use index-based filtering to avoid decoding games that don't match.
+The library uses:
+- **Lazy loading** - instant database open, data loaded on demand
+- **Memory-mapped files** - efficient access without loading entire files
+- **Player-game index** - built on first search, enables instant subsequent lookups
+- **Index-based filtering** - avoids decoding games that don't match
 
 ## Installation
 
