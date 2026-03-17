@@ -15,6 +15,7 @@ from .game import Game, IndexEntry
 from .scid4 import Scid4Database
 from .scid5 import Scid5Database
 from .pgn import PgnDatabase
+from .namebase_interface import NameBaseInterface
 
 
 class Database:
@@ -64,6 +65,7 @@ class Database:
     def __init__(self, backend: Union[Scid4Database, Scid5Database, PgnDatabase]):
         self._backend = backend
         self._format: str = ""
+        self._namebase_interface: Optional[NameBaseInterface] = None
 
         if isinstance(backend, Scid4Database):
             self._format = "scid4"
@@ -273,6 +275,50 @@ class Database:
             return self._backend.description
         return ""
 
+    @property
+    def namebase(self) -> NameBaseInterface:
+        """
+        Access the database namebase for browsing names.
+
+        Provides access to all unique names stored in the database:
+        - players: All player names with IDs
+        - events: All event names with IDs
+        - sites: All site names with IDs
+        - rounds: All round names with IDs
+
+        Each entry includes an ID that can be used for fast ID-based searches.
+
+        Usage:
+            # Browse all players
+            for player in db.namebase.players:
+                print(f"ID {player.id}: {player.name}")
+
+            # Find specific player
+            magnus = [p for p in db.namebase.players
+                      if "Carlsen, Magnus" in p.name][0]
+
+            # Fast search by ID
+            games = list(db.search(white_id=magnus.id))
+
+        Note: Only available for SCID4 and SCID5 formats.
+
+        Returns:
+            NameBaseInterface for browsing names
+
+        Raises:
+            NotImplementedError: If called on PGN format database
+        """
+        if isinstance(self._backend, PgnDatabase):
+            raise NotImplementedError(
+                "NameBase access is not available for PGN format. "
+                "PGN databases do not have a separate namebase structure."
+            )
+
+        if self._namebase_interface is None:
+            self._namebase_interface = NameBaseInterface(self._backend)
+
+        return self._namebase_interface
+
     def get_game(self, index: int) -> Game:
         """
         Get a game by index.
@@ -313,8 +359,13 @@ class Database:
             white: str - Player name (partial match, case-insensitive)
             black: str - Player name (partial match, case-insensitive)
             player: str - Either player (partial match, case-insensitive)
+            white_id: int - White player ID (exact match, fastest)
+            black_id: int - Black player ID (exact match, fastest)
+            player_id: int - Either player ID (exact match, fastest)
             event: str - Event name (partial match, case-insensitive)
+            event_id: int - Event ID (exact match)
             site: str - Site name (partial match, case-insensitive)
+            site_id: int - Site ID (exact match)
             year: int - Game year (exact match)
             year_min: int - Minimum year
             year_max: int - Maximum year

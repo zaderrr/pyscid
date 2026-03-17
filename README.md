@@ -21,9 +21,12 @@ Benchmarks on a 10 million game database:
 | Operation | Time |
 |-----------|------|
 | Open database | **0.1 ms** |
-| First player search | **11 seconds** (builds index) |
-| Subsequent player searches | **0.5 - 1.5 seconds** |
-| Combined search (player + year) | **0.07 seconds** |
+| Load namebase (580K players) | **0.5 seconds** |
+| Search by name (first time) | **11 seconds** (builds index) |
+| Search by name (cached) | **0.5 - 1.5 seconds** |
+| Search by ID (first time) | **11 seconds** (builds index) |
+| Search by ID (cached) | **0.001 - 0.01 seconds** |
+| Combined search (ID + year) | **0.007 seconds** |
 | Access single game | **0.1 ms** |
 | Iterate 10,000 games | **1.4 seconds** |
 
@@ -64,8 +67,16 @@ print(f"Format: {db.format}")
 game = db[42]
 print(f"{game.white} vs {game.black}: {game.result}")
 
-# Search games - uses optimized index-based filtering
-for game in db.search(player="Carlsen", year_min=2020):
+# Browse the namebase to see what's in the database
+players = db.namebase.players
+print(f"Total players: {len(players)}")
+
+# Find a specific player
+magnus = [p for p in players if "Carlsen, Magnus" in p.name][0]
+print(f"Found: {magnus.name} (ID {magnus.id})")
+
+# Fast ID-based search (recommended)
+for game in db.search(player_id=magnus.id, year_min=2020):
     print(f"{game.white} vs {game.black}")
     print(f"  Date: {game.date_string}")
     print(f"  ECO: {game.eco}")
@@ -181,17 +192,72 @@ db.preload_namebase()
 
 db.close()
     # Release resources
+
+db.namebase
+    # Access namebase for browsing names (SI4/SI5 only)
 ```
+
+### NameBase Interface
+
+Browse all unique names in the database without loading games. Only available for SCID4/SCID5 formats.
+
+```python
+# Access the namebase
+players = db.namebase.players   # All player names
+events = db.namebase.events     # All event names
+sites = db.namebase.sites       # All site names
+rounds = db.namebase.rounds     # All round names
+
+# Each entry has an ID and name
+print(f"Total players: {len(players)}")
+for player in players[:10]:
+    print(f"ID {player.id}: {player.name}")
+
+# Find specific names
+magnus = [p for p in players if "Carlsen, Magnus" in p.name][0]
+print(f"Found: {magnus.name} (ID {magnus.id})")
+
+# Use ID for fast searches (much faster than name search)
+games = list(db.search(white_id=magnus.id))
+print(f"Found {len(games)} games")
+
+# ID-based searches work with all name types
+event = [e for e in events if "World Championship" in e.name][0]
+games = list(db.search(event_id=event.id))
+
+# Combine ID search with other criteria (very fast!)
+games = list(db.search(player_id=magnus.id, year=2020))
+```
+
+**Performance:** Browsing the namebase is fast because it only loads the compressed name file:
+- 580K players loaded in ~0.5 seconds
+- 237K events loaded in ~0.05 seconds
+- 82K sites loaded in ~0.02 seconds
+
+**ID-based searches are fastest:**
+- First ID search: ~10 seconds (builds player-game index)
+- Subsequent ID searches: 0.001-0.01 seconds (uses cached index)
+- Name-based searches: 0.5-1.5 seconds (requires name lookup)
 
 ### Search Criteria
 
 ```python
 db.search(
-    white="Carlsen",      # White player (partial match)
-    black="Nakamura",     # Black player (partial match)
-    player="Carlsen",     # Either player (partial match)
-    event="Tata Steel",   # Event name (partial match)
-    site="Wijk aan Zee",  # Site name (partial match)
+    # Name-based searches (slower, partial match, case-insensitive)
+    white="Carlsen",      # White player name
+    black="Nakamura",     # Black player name
+    player="Carlsen",     # Either player name
+    event="Tata Steel",   # Event name
+    site="Wijk aan Zee",  # Site name
+    
+    # ID-based searches (fastest, exact match) - SI4/SI5 only
+    white_id=1324,        # White player ID (from db.namebase.players)
+    black_id=5678,        # Black player ID
+    player_id=1324,       # Either player ID
+    event_id=42,          # Event ID (from db.namebase.events)
+    site_id=99,           # Site ID (from db.namebase.sites)
+    
+    # Other criteria
     year=2024,            # Exact year
     year_min=2020,        # Minimum year
     year_max=2024,        # Maximum year
@@ -201,7 +267,13 @@ db.search(
 )
 ```
 
-All criteria are optional and combined with AND logic. Name searches are case-insensitive.
+All criteria are optional and combined with AND logic.
+
+**Search performance tips:**
+- Use ID-based searches when possible (10-100x faster than name searches)
+- Browse `db.namebase` to get IDs for players/events/sites
+- Combine ID searches with other criteria for maximum speed
+- Name searches build indexes on first use, making subsequent searches faster
 
 ### Game
 

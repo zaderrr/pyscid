@@ -755,8 +755,13 @@ class Scid5Database:
             white: str - White player name (partial match, case-insensitive)
             black: str - Black player name (partial match, case-insensitive)
             player: str - Either player (partial match, case-insensitive)
+            white_id: int - White player ID (exact match, fastest)
+            black_id: int - Black player ID (exact match, fastest)
+            player_id: int - Either player ID (exact match, fastest)
             event: str - Event name (partial match, case-insensitive)
+            event_id: int - Event ID (exact match)
             site: str - Site name (partial match, case-insensitive)
+            site_id: int - Site ID (exact match)
             year: int - Game year (exact match)
             year_min: int - Minimum year
             year_max: int - Maximum year
@@ -774,6 +779,7 @@ class Scid5Database:
         event_ids: Optional[Set[int]] = None
         site_ids: Optional[Set[int]] = None
 
+        # Handle name-based searches (slower - requires name index build)
         if criteria.get("white"):
             white_ids = self._find_matching_player_ids(criteria["white"])
             if not white_ids:
@@ -796,6 +802,37 @@ class Scid5Database:
 
         if criteria.get("site"):
             site_ids = self._find_matching_site_ids(criteria["site"])
+            if not site_ids:
+                return
+
+        # Handle ID-based searches (fastest - direct integer comparison)
+        if "white_id" in criteria:
+            white_id = criteria["white_id"]
+            white_ids = {white_id} if white_ids is None else white_ids & {white_id}
+            if not white_ids:
+                return
+
+        if "black_id" in criteria:
+            black_id = criteria["black_id"]
+            black_ids = {black_id} if black_ids is None else black_ids & {black_id}
+            if not black_ids:
+                return
+
+        if "player_id" in criteria:
+            pid = criteria["player_id"]
+            player_ids = {pid} if player_ids is None else player_ids & {pid}
+            if not player_ids:
+                return
+
+        if "event_id" in criteria:
+            eid = criteria["event_id"]
+            event_ids = {eid} if event_ids is None else event_ids & {eid}
+            if not event_ids:
+                return
+
+        if "site_id" in criteria:
+            sid = criteria["site_id"]
+            site_ids = {sid} if site_ids is None else site_ids & {sid}
             if not site_ids:
                 return
 
