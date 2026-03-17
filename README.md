@@ -2,6 +2,8 @@
 
 A pure Python library for reading SCID chess database files (.si4, .si5).
 
+This is pretty much all vibecoded.. use with caution. 
+
 ## Features
 
 - Read **SI4** databases (`.si4`, `.sn4`, `.sg4`)

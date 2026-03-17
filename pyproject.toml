@@ -10,10 +10,10 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = "GPL-2.0-only"
 authors = [
-    {name = "zaderrr", email = "your.email@example.com"}
+    {name = "zaderrr", email = "ellisbrown88@gmail.com"}
 ]
 maintainers = [
-    {name = "zaderrr", email = "your.email@example.com"}
+    {name = "zaderrr", email = "ellisbrown88@gmail.com"}
 ]
 keywords = [
     "chess",
