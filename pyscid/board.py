@@ -356,11 +356,15 @@ class Board:
             if to_sq - from_sq == 2:  # Kingside castle
                 rook_from = from_sq + 3
                 rook_to = from_sq + 1
-                self._move_rook_for_castle(color, rook_from, rook_to)
+                # Only move rook if squares are valid
+                if Square.is_valid(rook_from) and Square.is_valid(rook_to):
+                    self._move_rook_for_castle(color, rook_from, rook_to)
             elif from_sq - to_sq == 2:  # Queenside castle
                 rook_from = from_sq - 4
                 rook_to = from_sq - 1
-                self._move_rook_for_castle(color, rook_from, rook_to)
+                # Only move rook if squares are valid
+                if Square.is_valid(rook_from) and Square.is_valid(rook_to):
+                    self._move_rook_for_castle(color, rook_from, rook_to)
 
             # King moved, lose castling rights
             self.can_castle_kingside[color] = False
@@ -378,6 +382,10 @@ class Board:
 
     def _move_rook_for_castle(self, color: Color, from_sq: int, to_sq: int):
         """Move a rook during castling"""
+        # Safety check for invalid squares
+        if not Square.is_valid(from_sq) or not Square.is_valid(to_sq):
+            return
+
         occupant = self.board[from_sq]
         if occupant is None:
             return

@@ -264,34 +264,64 @@ class Scid5Database:
     """
     SCID version 5 database reader.
 
+    Supports lazy loading for fast database opening. By default, only the
+    file size is checked on open. Index entries and namebase are loaded on demand.
+
     Usage:
+        # Default: lazy loading (instant open)
         db = Scid5Database.open("games.si5")
+
+        # Preload everything (for full iteration)
+        db = Scid5Database.open("games.si5", preload=True)
+
+        # Preload just namebase (fast metadata access)
+        db = Scid5Database.open("games.si5", preload_names=True)
+
+        # Enable LRU cache for repeated random access
+        db = Scid5Database.open("games.si5", cache_size=10000)
+
         for game in db:
             print(game.white, "vs", game.black)
     """
 
     def __init__(self):
         self.namebase: Optional[NameBase5] = None
-        self.index_entries: List[IndexEntry] = []
         self._index_file: Optional[BinaryIO] = None
+        self._index_mmap: Optional[mmap.mmap] = None
         self._game_file: Optional[BinaryIO] = None
         self._game_mmap: Optional[mmap.mmap] = None
         self._base_path: str = ""
+        self._namebase_path: str = ""
+        self._num_games: int = 0
+        # Cache for index entries (None = disabled, dict = LRU cache)
+        self._index_cache: Optional[Dict[int, IndexEntry]] = None
+        self._cache_size: int = 0
+        # For preloaded mode: store all entries in a list
+        self._preloaded_entries: Optional[List[IndexEntry]] = None
 
     @property
     def description(self) -> str:
         """Get database description"""
+        self._ensure_namebase_loaded()
         if self.namebase:
             return self.namebase.db_info.get("description", "")
         return ""
 
     @staticmethod
-    def open(filepath: str) -> "Scid5Database":
+    def open(
+        filepath: str,
+        preload: bool = False,
+        preload_names: bool = False,
+        cache_size: int = 0,
+    ) -> "Scid5Database":
         """
         Open a SCID5 database.
 
         Args:
             filepath: Path to .si5 file (or base name without extension)
+            preload: If True, load all index entries upfront (slower open, faster iteration)
+            preload_names: If True, load namebase immediately (otherwise lazy-loaded)
+            cache_size: Size of LRU cache for index entries (0 = disabled)
 
         Returns:
             Scid5Database instance ready for reading
@@ -308,13 +338,10 @@ class Scid5Database:
         db._base_path = str(base_path)
 
         index_path = str(base_path) + ".si5"
-        namebase_path = str(base_path) + ".sn5"
+        db._namebase_path = str(base_path) + ".sn5"
         game_path = str(base_path) + ".sg5"
 
-        # Read namebase
-        db.namebase = NameBase5.read_from_file(namebase_path)
-
-        # Open and read index file
+        # Open index file and get number of games from file size
         db._index_file = open(index_path, "rb")
 
         # Get file size to determine number of games
@@ -325,15 +352,29 @@ class Scid5Database:
         if file_size % INDEX_ENTRY_SIZE != 0:
             raise ValueError(f"Invalid index file size: {file_size}")
 
-        num_games = file_size // INDEX_ENTRY_SIZE
+        db._num_games = file_size // INDEX_ENTRY_SIZE
 
-        # Read all index entries
-        for _ in range(num_games):
-            entry_data = db._index_file.read(INDEX_ENTRY_SIZE)
-            if len(entry_data) < INDEX_ENTRY_SIZE:
-                break
-            ie = decode_index_entry_v5(entry_data)
-            db.index_entries.append(ie)
+        # Memory-map the index file for lazy access
+        try:
+            db._index_mmap = mmap.mmap(
+                db._index_file.fileno(), 0, access=mmap.ACCESS_READ
+            )
+        except ValueError:
+            # Empty file - will handle in get_index_entry
+            db._index_mmap = None
+
+        # Set up caching if requested
+        if cache_size > 0:
+            db._cache_size = cache_size
+            db._index_cache = {}
+
+        # Preload namebase if requested
+        if preload_names or preload:
+            db._ensure_namebase_loaded()
+
+        # Preload all index entries if requested
+        if preload:
+            db._preload_index_entries()
 
         # Open game file for reading game data
         db._game_file = open(game_path, "rb")
@@ -346,6 +387,40 @@ class Scid5Database:
 
         return db
 
+    def _ensure_namebase_loaded(self):
+        """Load namebase on first access (lazy loading)"""
+        if self.namebase is None:
+            self.namebase = NameBase5.read_from_file(self._namebase_path)
+
+    def _preload_index_entries(self):
+        """Load all index entries into memory (for preload mode)"""
+        if self._preloaded_entries is not None:
+            return  # Already preloaded
+
+        self._preloaded_entries = []
+        if self._index_mmap is None:
+            return
+
+        for i in range(self._num_games):
+            offset = i * INDEX_ENTRY_SIZE
+            entry_data = self._index_mmap[offset : offset + INDEX_ENTRY_SIZE]
+            ie = decode_index_entry_v5(bytes(entry_data))
+            self._preloaded_entries.append(ie)
+
+    def preload_all(self):
+        """Explicitly load all data after opening (namebase + all index entries)"""
+        self._ensure_namebase_loaded()
+        self._preload_index_entries()
+
+    def preload_namebase(self):
+        """Explicitly load just the namebase"""
+        self._ensure_namebase_loaded()
+
+    def clear_cache(self):
+        """Clear the index entry cache"""
+        if self._index_cache is not None:
+            self._index_cache.clear()
+
     def close(self):
         """Close all open files"""
         if self._game_mmap:
@@ -354,6 +429,9 @@ class Scid5Database:
         if self._game_file:
             self._game_file.close()
             self._game_file = None
+        if self._index_mmap:
+            self._index_mmap.close()
+            self._index_mmap = None
         if self._index_file:
             self._index_file.close()
             self._index_file = None
@@ -366,20 +444,66 @@ class Scid5Database:
         return False
 
     def __len__(self) -> int:
-        return len(self.index_entries)
+        return self._num_games
 
     def __iter__(self) -> Iterator[Game]:
-        for i in range(len(self)):
-            yield self[i]
+        """Iterate over all games with batch optimization"""
+        # Use batch prefetching for efficient iteration
+        BATCH_SIZE = 1000
+        num_games = len(self)
+
+        for batch_start in range(0, num_games, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, num_games)
+
+            # Pre-fetch index entries for this batch
+            entries = []
+            for i in range(batch_start, batch_end):
+                entries.append(self.get_index_entry(i))
+
+            # Yield games from this batch
+            for ie in entries:
+                yield self._get_game_from_entry(ie)
 
     def __getitem__(self, index: int) -> Game:
-        if index < 0 or index >= len(self.index_entries):
+        if index < 0 or index >= len(self):
             raise IndexError(f"Game index {index} out of range")
         return self.get_game(index)
 
     def get_index_entry(self, game_num: int) -> IndexEntry:
-        """Get raw index entry for a game"""
-        return self.index_entries[game_num]
+        """
+        Get raw index entry for a game.
+
+        Uses preloaded entries if available, otherwise decodes from mmap.
+        Caches entries if cache_size > 0.
+        """
+        if game_num < 0 or game_num >= len(self):
+            raise IndexError(f"Game index {game_num} out of range")
+
+        # Check preloaded entries first
+        if self._preloaded_entries is not None:
+            return self._preloaded_entries[game_num]
+
+        # Check cache
+        if self._index_cache is not None and game_num in self._index_cache:
+            return self._index_cache[game_num]
+
+        # Decode from mmap
+        if self._index_mmap is None:
+            raise RuntimeError("Database not properly initialized")
+
+        offset = game_num * INDEX_ENTRY_SIZE
+        entry_data = self._index_mmap[offset : offset + INDEX_ENTRY_SIZE]
+        ie = decode_index_entry_v5(bytes(entry_data))
+
+        # Store in cache if enabled (simple LRU: evict oldest when full)
+        if self._index_cache is not None:
+            if len(self._index_cache) >= self._cache_size:
+                # Remove oldest entry (first key in dict - Python 3.7+ preserves order)
+                oldest_key = next(iter(self._index_cache))
+                del self._index_cache[oldest_key]
+            self._index_cache[game_num] = ie
+
+        return ie
 
     def get_game_data(self, ie: IndexEntry) -> bytes:
         """Get raw game data bytes for an index entry"""
@@ -390,22 +514,24 @@ class Scid5Database:
             return self._game_file.read(ie.length)
         return b""
 
-    def get_game(self, game_num: int) -> Game:
+    def _get_game_from_entry(self, ie: IndexEntry) -> Game:
         """
-        Get a fully decoded Game object.
-        """
-        ie = self.index_entries[game_num]
+        Create a Game object from an IndexEntry.
 
-        nb = self.namebase
-        if nb is None:
-            raise RuntimeError("Database not properly initialized")
+        Internal method used by get_game and iteration.
+        """
+        # Ensure namebase is loaded before accessing names
+        self._ensure_namebase_loaded()
+
+        if self.namebase is None:
+            raise RuntimeError("Failed to load namebase")
 
         game = Game(
-            white=nb.get_player(ie.white_id),
-            black=nb.get_player(ie.black_id),
-            event=nb.get_event(ie.event_id),
-            site=nb.get_site(ie.site_id),
-            round=nb.get_round(ie.round_id),
+            white=self.namebase.get_player(ie.white_id),
+            black=self.namebase.get_player(ie.black_id),
+            event=self.namebase.get_event(ie.event_id),
+            site=self.namebase.get_site(ie.site_id),
+            round=self.namebase.get_round(ie.round_id),
             date=date_to_python(ie.date),
             event_date=date_to_python(ie.event_date),
             date_raw=ie.date,
@@ -429,3 +555,16 @@ class Scid5Database:
             decode_game_data(game, game_data, ie)
 
         return game
+
+    def get_game(self, game_num: int) -> Game:
+        """
+        Get a fully decoded Game object.
+
+        Args:
+            game_num: 0-based game index
+
+        Returns:
+            Game object with all metadata and moves
+        """
+        ie = self.get_index_entry(game_num)
+        return self._get_game_from_entry(ie)

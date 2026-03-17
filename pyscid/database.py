@@ -3,6 +3,9 @@ Unified database interface for reading chess game databases.
 
 Provides a single Database class that can open SCID4, SCID5, and PGN files,
 automatically detecting the format based on file extension.
+
+Supports lazy loading for fast database opening - by default only metadata
+is loaded, with index entries and namebase loaded on demand.
 """
 
 from pathlib import Path
@@ -23,12 +26,24 @@ class Database:
     - SCID5 format (.si5)
     - PGN format (.pgn)
 
+    Loading modes (SCID formats only):
+    - Default (lazy): Instant open, data loaded on demand
+    - preload=True: Load everything upfront (like original behavior)
+    - preload_names=True: Load namebase only, lazy index entries
+    - cache_size=N: Enable LRU cache for repeated random access
+
     Usage:
-        # Open any supported format
+        # Default: lazy loading (instant open)
         db = Database.open("games.si4")
 
-        # Or use auto-detection
-        db = Database.open("games")  # Will try .si4, .si5, .pgn
+        # Preload everything (for full iteration)
+        db = Database.open("games.si4", preload=True)
+
+        # Preload just namebase (fast metadata access)
+        db = Database.open("games.si4", preload_names=True)
+
+        # Enable LRU cache for repeated random access
+        db = Database.open("games.si4", cache_size=10000)
 
         # Iterate through games
         for game in db:
@@ -58,7 +73,12 @@ class Database:
             self._format = "pgn"
 
     @staticmethod
-    def open(filepath: str) -> "Database":
+    def open(
+        filepath: str,
+        preload: bool = False,
+        preload_names: bool = False,
+        cache_size: int = 0,
+    ) -> "Database":
         """
         Open a chess database file.
 
@@ -71,6 +91,12 @@ class Database:
 
         Args:
             filepath: Path to database file (with or without extension)
+            preload: If True, load all data upfront (SCID formats only).
+                     Slower open but faster iteration.
+            preload_names: If True, load namebase immediately (SCID formats only).
+                           Useful for fast metadata access.
+            cache_size: Size of LRU cache for index entries (SCID formats only).
+                        0 = disabled. Useful for repeated random access.
 
         Returns:
             Database instance
@@ -85,9 +111,9 @@ class Database:
         suffix = path.suffix.lower()
 
         if suffix == ".si4":
-            return Database._open_scid4(filepath)
+            return Database._open_scid4(filepath, preload, preload_names, cache_size)
         elif suffix == ".si5":
-            return Database._open_scid5(filepath)
+            return Database._open_scid5(filepath, preload, preload_names, cache_size)
         elif suffix == ".pgn":
             return Database._open_pgn(filepath)
 
@@ -96,11 +122,15 @@ class Database:
 
         # Try SCID4
         if Path(base + ".si4").exists():
-            return Database._open_scid4(base + ".si4")
+            return Database._open_scid4(
+                base + ".si4", preload, preload_names, cache_size
+            )
 
         # Try SCID5
         if Path(base + ".si5").exists():
-            return Database._open_scid5(base + ".si5")
+            return Database._open_scid5(
+                base + ".si5", preload, preload_names, cache_size
+            )
 
         # Try PGN
         if Path(base + ".pgn").exists():
@@ -115,7 +145,9 @@ class Database:
             if magic.startswith(b"Scid.si"):
                 # It's a SCID index file - check version
                 if b"4" in magic or magic == b"Scid.si\x00":
-                    return Database._open_scid4(filepath)
+                    return Database._open_scid4(
+                        filepath, preload, preload_names, cache_size
+                    )
             elif magic.startswith(b"["):
                 # Looks like PGN
                 return Database._open_pgn(filepath)
@@ -126,20 +158,40 @@ class Database:
         )
 
     @staticmethod
-    def _open_scid4(filepath: str) -> "Database":
+    def _open_scid4(
+        filepath: str,
+        preload: bool = False,
+        preload_names: bool = False,
+        cache_size: int = 0,
+    ) -> "Database":
         """Open a SCID4 database"""
-        backend = Scid4Database.open(filepath)
+        backend = Scid4Database.open(
+            filepath,
+            preload=preload,
+            preload_names=preload_names,
+            cache_size=cache_size,
+        )
         return Database(backend)
 
     @staticmethod
-    def _open_scid5(filepath: str) -> "Database":
+    def _open_scid5(
+        filepath: str,
+        preload: bool = False,
+        preload_names: bool = False,
+        cache_size: int = 0,
+    ) -> "Database":
         """Open a SCID5 database"""
-        backend = Scid5Database.open(filepath)
+        backend = Scid5Database.open(
+            filepath,
+            preload=preload,
+            preload_names=preload_names,
+            cache_size=cache_size,
+        )
         return Database(backend)
 
     @staticmethod
     def _open_pgn(filepath: str) -> "Database":
-        """Open a PGN file"""
+        """Open a PGN file (always fully loaded)"""
         backend = PgnDatabase.open(filepath)
         return Database(backend)
 
@@ -153,6 +205,39 @@ class Database:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
+
+    def preload_all(self):
+        """
+        Explicitly load all data (namebase + all index entries).
+
+        Call this after opening with lazy loading if you want to
+        preload everything for faster subsequent access.
+
+        Only affects SCID formats; PGN is always fully loaded.
+        """
+        if isinstance(self._backend, (Scid4Database, Scid5Database)):
+            self._backend.preload_all()
+
+    def preload_namebase(self):
+        """
+        Explicitly load just the namebase.
+
+        Useful if you want fast access to player/event/site names
+        without loading all index entries.
+
+        Only affects SCID formats; PGN is always fully loaded.
+        """
+        if isinstance(self._backend, (Scid4Database, Scid5Database)):
+            self._backend.preload_namebase()
+
+    def clear_cache(self):
+        """
+        Clear the index entry cache.
+
+        Only has effect if cache_size > 0 was specified on open.
+        """
+        if isinstance(self._backend, (Scid4Database, Scid5Database)):
+            self._backend.clear_cache()
 
     def __len__(self) -> int:
         """Return the number of games in the database"""

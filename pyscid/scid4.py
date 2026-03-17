@@ -351,8 +351,22 @@ class Scid4Database:
     """
     SCID version 4 database reader.
 
+    Supports lazy loading for fast database opening. By default, only the header
+    is read on open. Index entries and namebase are loaded on demand.
+
     Usage:
+        # Default: lazy loading (instant open)
         db = Scid4Database.open("games.si4")
+
+        # Preload everything (current behavior, for full iteration)
+        db = Scid4Database.open("games.si4", preload=True)
+
+        # Preload just namebase (fast metadata access)
+        db = Scid4Database.open("games.si4", preload_names=True)
+
+        # Enable LRU cache for repeated random access
+        db = Scid4Database.open("games.si4", cache_size=10000)
+
         for game in db:
             print(game.white, "vs", game.black)
     """
@@ -360,19 +374,34 @@ class Scid4Database:
     def __init__(self):
         self.header: Optional[IndexHeader] = None
         self.namebase: Optional[NameBase] = None
-        self.index_entries: List[IndexEntry] = []
         self._index_file: Optional[BinaryIO] = None
+        self._index_mmap: Optional[mmap.mmap] = None
         self._game_file: Optional[BinaryIO] = None
         self._game_mmap: Optional[mmap.mmap] = None
         self._base_path: str = ""
+        self._namebase_path: str = ""
+        self._entry_size: int = INDEX_ENTRY_SIZE_V4
+        # Cache for index entries (None = disabled, dict = LRU cache)
+        self._index_cache: Optional[Dict[int, IndexEntry]] = None
+        self._cache_size: int = 0
+        # For preloaded mode: store all entries in a list
+        self._preloaded_entries: Optional[List[IndexEntry]] = None
 
     @staticmethod
-    def open(filepath: str) -> "Scid4Database":
+    def open(
+        filepath: str,
+        preload: bool = False,
+        preload_names: bool = False,
+        cache_size: int = 0,
+    ) -> "Scid4Database":
         """
         Open a SCID4 database.
 
         Args:
             filepath: Path to .si4 file (or base name without extension)
+            preload: If True, load all index entries upfront (slower open, faster iteration)
+            preload_names: If True, load namebase immediately (otherwise lazy-loaded)
+            cache_size: Size of LRU cache for index entries (0 = disabled)
 
         Returns:
             Scid4Database instance ready for reading
@@ -389,13 +418,10 @@ class Scid4Database:
         db._base_path = str(base_path)
 
         index_path = str(base_path) + ".si4"
-        namebase_path = str(base_path) + ".sn4"
+        db._namebase_path = str(base_path) + ".sn4"
         game_path = str(base_path) + ".sg4"
 
-        # Read namebase
-        db.namebase = NameBase.read_from_file(namebase_path)
-
-        # Open and read index file
+        # Open and read index header only
         db._index_file = open(index_path, "rb")
         db.header = read_index_header(db._index_file)
 
@@ -403,17 +429,32 @@ class Scid4Database:
         if db.header.version < SCID_OLDEST_VERSION or db.header.version > SCID_VERSION:
             raise ValueError(f"Unsupported SCID version: {db.header.version}")
 
-        # Read all index entries
-        entry_size = (
+        # Set entry size based on version
+        db._entry_size = (
             INDEX_ENTRY_SIZE_V4 if db.header.version >= 400 else INDEX_ENTRY_SIZE_V3
         )
 
-        for _ in range(db.header.num_games):
-            entry_data = db._index_file.read(entry_size)
-            if len(entry_data) < entry_size:
-                break
-            ie = decode_index_entry(entry_data, db.header.version)
-            db.index_entries.append(ie)
+        # Memory-map the index file for lazy access
+        try:
+            db._index_mmap = mmap.mmap(
+                db._index_file.fileno(), 0, access=mmap.ACCESS_READ
+            )
+        except ValueError:
+            # Empty file - will handle in get_index_entry
+            db._index_mmap = None
+
+        # Set up caching if requested
+        if cache_size > 0:
+            db._cache_size = cache_size
+            db._index_cache = {}
+
+        # Preload namebase if requested
+        if preload_names or preload:
+            db._ensure_namebase_loaded()
+
+        # Preload all index entries if requested
+        if preload:
+            db._preload_index_entries()
 
         # Open game file for reading game data
         db._game_file = open(game_path, "rb")
@@ -427,6 +468,40 @@ class Scid4Database:
 
         return db
 
+    def _ensure_namebase_loaded(self):
+        """Load namebase on first access (lazy loading)"""
+        if self.namebase is None:
+            self.namebase = NameBase.read_from_file(self._namebase_path)
+
+    def _preload_index_entries(self):
+        """Load all index entries into memory (for preload mode)"""
+        if self._preloaded_entries is not None:
+            return  # Already preloaded
+
+        self._preloaded_entries = []
+        if self._index_mmap is None or self.header is None:
+            return
+
+        for i in range(self.header.num_games):
+            offset = INDEX_HEADER_SIZE + (i * self._entry_size)
+            entry_data = self._index_mmap[offset : offset + self._entry_size]
+            ie = decode_index_entry(bytes(entry_data), self.header.version)
+            self._preloaded_entries.append(ie)
+
+    def preload_all(self):
+        """Explicitly load all data after opening (namebase + all index entries)"""
+        self._ensure_namebase_loaded()
+        self._preload_index_entries()
+
+    def preload_namebase(self):
+        """Explicitly load just the namebase"""
+        self._ensure_namebase_loaded()
+
+    def clear_cache(self):
+        """Clear the index entry cache"""
+        if self._index_cache is not None:
+            self._index_cache.clear()
+
     def close(self):
         """Close all open files"""
         if self._game_mmap:
@@ -435,6 +510,9 @@ class Scid4Database:
         if self._game_file:
             self._game_file.close()
             self._game_file = None
+        if self._index_mmap:
+            self._index_mmap.close()
+            self._index_mmap = None
         if self._index_file:
             self._index_file.close()
             self._index_file = None
@@ -447,40 +525,89 @@ class Scid4Database:
         return False
 
     def __len__(self) -> int:
-        return len(self.index_entries)
+        if self.header is None:
+            return 0
+        return self.header.num_games
 
     def __iter__(self) -> Iterator[Game]:
-        for i in range(len(self)):
-            yield self[i]
+        """Iterate over all games with batch optimization"""
+        # Use batch prefetching for efficient iteration
+        BATCH_SIZE = 1000
+        num_games = len(self)
+
+        for batch_start in range(0, num_games, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, num_games)
+
+            # Pre-fetch index entries for this batch
+            entries = []
+            for i in range(batch_start, batch_end):
+                entries.append(self.get_index_entry(i))
+
+            # Yield games from this batch
+            for ie in entries:
+                yield self._get_game_from_entry(ie)
 
     def __getitem__(self, index: int) -> Game:
-        if index < 0 or index >= len(self.index_entries):
+        if index < 0 or index >= len(self):
             raise IndexError(f"Game index {index} out of range")
         return self.get_game(index)
 
     def get_index_entry(self, game_num: int) -> IndexEntry:
-        """Get raw index entry for a game"""
-        return self.index_entries[game_num]
+        """
+        Get raw index entry for a game.
+
+        Uses preloaded entries if available, otherwise decodes from mmap.
+        Caches entries if cache_size > 0.
+        """
+        if game_num < 0 or game_num >= len(self):
+            raise IndexError(f"Game index {game_num} out of range")
+
+        # Check preloaded entries first
+        if self._preloaded_entries is not None:
+            return self._preloaded_entries[game_num]
+
+        # Check cache
+        if self._index_cache is not None and game_num in self._index_cache:
+            return self._index_cache[game_num]
+
+        # Decode from mmap
+        if self._index_mmap is None or self.header is None:
+            raise RuntimeError("Database not properly initialized")
+
+        offset = INDEX_HEADER_SIZE + (game_num * self._entry_size)
+        entry_data = self._index_mmap[offset : offset + self._entry_size]
+        ie = decode_index_entry(bytes(entry_data), self.header.version)
+
+        # Store in cache if enabled (simple LRU: evict oldest when full)
+        if self._index_cache is not None:
+            if len(self._index_cache) >= self._cache_size:
+                # Remove oldest entry (first key in dict - Python 3.7+ preserves order)
+                oldest_key = next(iter(self._index_cache))
+                del self._index_cache[oldest_key]
+            self._index_cache[game_num] = ie
+
+        return ie
 
     def get_game_data(self, ie: IndexEntry) -> bytes:
         """Get raw game data bytes for an index entry"""
         if self._game_mmap:
             return bytes(self._game_mmap[ie.offset : ie.offset + ie.length])
-        else:
+        elif self._game_file:
             self._game_file.seek(ie.offset)
             return self._game_file.read(ie.length)
+        return b""
 
-    def get_game(self, game_num: int) -> Game:
+    def _get_game_from_entry(self, ie: IndexEntry) -> Game:
         """
-        Get a fully decoded Game object.
+        Create a Game object from an IndexEntry.
 
-        Args:
-            game_num: 0-based game index
-
-        Returns:
-            Game object with all metadata and moves
+        Internal method used by get_game and iteration.
         """
-        ie = self.index_entries[game_num]
+        # Ensure namebase is loaded before accessing names
+        self._ensure_namebase_loaded()
+
+        if self.namebase is None:
+            raise RuntimeError("Failed to load namebase")
 
         # Create game with metadata from index entry
         game = Game(
@@ -510,6 +637,19 @@ class Scid4Database:
             self._decode_game_data(game, game_data, ie)
 
         return game
+
+    def get_game(self, game_num: int) -> Game:
+        """
+        Get a fully decoded Game object.
+
+        Args:
+            game_num: 0-based game index
+
+        Returns:
+            Game object with all metadata and moves
+        """
+        ie = self.get_index_entry(game_num)
+        return self._get_game_from_entry(ie)
 
     def _decode_game_data(self, game: Game, data: bytes, ie: IndexEntry):
         """
